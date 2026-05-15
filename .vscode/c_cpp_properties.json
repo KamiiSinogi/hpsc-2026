@@ -1,7 +1,8 @@
 {
-    "configurations": [
+    "configurations":
+    [
         {
-            "name": "Linux",
+            "name": "CPU",
             "includePath": [
                 "${workspaceFolder}/**",
                 "/mnt/nfs/packages/x86_64/openmpi/openmpi-5.0-cuda-12.8/include"
@@ -11,7 +12,21 @@
             "cStandard": "c17",
             "cppStandard": "gnu++17",
             "intelliSenseMode": "linux-gcc-x64"
+        },
+        {
+            "name": "CUDA",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/mnt/nfs/packages/x86_64/openmpi/openmpi-5.0-cuda-12.8/include",
+                "/mnt/nfs/packages/x86_64/cuda/cuda-13.2/include"
+            ],
+            "defines": [],
+            "compilerPath": "/mnt/nfs/packages/x86_64/cuda/cuda-13.2/bin/nvcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64"
         }
     ],
+
     "version": 4
 }
