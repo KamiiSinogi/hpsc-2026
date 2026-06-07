@@ -127,8 +127,8 @@ __global__ void kernel(int M, int N, int K, half *A, half *B, float *C)
     int warp_m_offset = warp_m * WM;
     int warp_n_offset = warp_n * WN;
 
-    __shared__ half block_A[BK][BM];         // 128 × 32 = 8 KB
-    __shared__ half block_B[BN][BK];         // 32 × 128 = 8 KB
+    __shared__ half block_A[STAGES][BK][BM];         // 128 × 32 = 8 KB
+    __shared__ half block_B[STAGES][BN][BK];         // 32 × 128 = 8 KB
     float res[MMA_PER_WARP_M][MMA_PER_WARP_N][4];
     #pragma unroll
     for (int i=0; i<MMA_PER_WARP_M; i++)
@@ -138,21 +138,42 @@ __global__ void kernel(int M, int N, int K, half *A, half *B, float *C)
             for (int k=0; k<4; k++)
                 res[i][j][k] = 0.0f;
 
+    auto issue = [&](int stage, int k_tile)
+    {
+        #pragma unroll
+        for (int k=0; k<4; k++)
+        {
+            int id = k * THREADS + tid;
+            int off_k = id / 16;
+            int off_m = id % 16 * 8;
+            const half *src = &A_at(A, block_m+off_m, k_tile+off_k);
+            cp_async_16(&block_A[stage][off_k][off_m], src);
+        }
+        #pragma unroll
+        for (int j=0; j<4; j++)
+        {
+            int id = j * THREADS + tid;
+            int off_n = id / 4;
+            int off_k = id % 4 * 8;
+            const half *src = &B_at(B, k_tile+off_k, block_n+off_n);
+            cp_async_16(&block_B[stage][off_n][off_k], src);
+        }
+        cp_async_commit();
+    };
+
+    int num_tile = K / BK;
+    #pragma unroll
+    for (int k=0; k<STAGES-1; k++)
+    {
+        if (k<num_tile) issue(k, k*BK);
+        else cp_async_commit();
+    }
+
     for (int k_tile=0; k_tile<K; k_tile+=BK)
     {
+        cp_async_wait<STAGES-2>();
         __syncthreads();
-        #pragma unroll
-        for (int k=0; k<BK; k++)
-        {   
-            block_A[k][tid] = A_at(A, block_m+tid, k_tile+k);
-        }
-        #pragma unroll
-        for (int k=0; k<BK; k++)
-        {
-            block_B[tid][k] = B_at(B, k_tile+k, block_n+tid);
-        }
-        __syncthreads();
-
+        int stage = k_tile / BK % STAGES;
         #pragma unroll
         for (int k=0; k<K_ITER_PER_TILE; k++)
         {
@@ -162,7 +183,7 @@ __global__ void kernel(int M, int N, int K, half *A, half *B, float *C)
             for (int i=0; i<MMA_PER_WARP_M; i++)
             {
                 int mma_m = i * MMA_M;
-                const half *src = &block_A[mma_k+lane_id%16][warp_m_offset+mma_m+lane_id/16*8];
+                const half *src = &block_A[stage][mma_k+lane_id%16][warp_m_offset+mma_m+lane_id/16*8];
                 ldmatrix_x4_trans(frag_a[i][0], frag_a[i][2], frag_a[i][1], frag_a[i][3], src); //^T
             }
             uint32_t frag_b[MMA_PER_WARP_N][2];
@@ -172,7 +193,7 @@ __global__ void kernel(int M, int N, int K, half *A, half *B, float *C)
                 int mma_n = j * MMA_N * 2;
                 int row = (lane_id % 8) + (lane_id / 16) * 8;
                 int col = ((lane_id / 8) % 2) * 8;
-                const half *src =&block_B[warp_n_offset+mma_n+row][mma_k+col];
+                const half *src =&block_B[stage][warp_n_offset+mma_n+row][mma_k+col];
                 ldmatrix_x4(frag_b[j<<1][0], frag_b[j<<1][1], frag_b[j<<1|1][0], frag_b[j<<1|1][1], src);
             }
             #pragma unroll
@@ -189,6 +210,9 @@ __global__ void kernel(int M, int N, int K, half *A, half *B, float *C)
                 }
             }
         }
+        int next_stage = k_tile / BK + STAGES - 1;
+        if (next_stage < num_tile) issue(next_stage%STAGES, next_stage*BK);
+        else cp_async_commit();
     }
     int group_row = lane_id / 4;
     int group_col = lane_id % 4;
