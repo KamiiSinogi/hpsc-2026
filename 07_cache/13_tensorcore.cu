@@ -21,11 +21,12 @@ constexpr int MMA_PER_WARP_M = WM / MMA_M;        // 4
 constexpr int MMA_PER_WARP_N = WN / MMA_N;        // 8
 constexpr int K_ITER_PER_TILE = BK / MMA_K;       // 2
 
-constexpr int STAGES = 3;                         // Best choice
+constexpr int STAGES = 4;                         // Best choice
 
 __device__ __forceinline__ half &A_at(half *A, int i, int j, int M=10240) {return A[i+j*M];}
 __device__ __forceinline__ half &B_at(half *B, int i, int j, int K=4096) {return B[i+j*K];}
 __device__ __forceinline__ float &C_at(float *C, int i, int j, int M=10240) {return C[i+j*M];}
+__device__ __forceinline__ int swz(int outer, int inner) {return inner^((outer&7)<<3);}
 
 __device__ __forceinline__ uint32_t smem_ptr_to_uint(const void *ptr)
 {
@@ -102,8 +103,8 @@ __global__ __launch_bounds__(128, 3) void kernel(int M, int N, int K, half *A, h
     int warp_n = warp_id % WARPS_N;          // 0..1
     int warp_m_offset = warp_m * WM;
     int warp_n_offset = warp_n * WN;
-    __shared__ half block_A[STAGES][BK][BM+8];         // 128 × 40 = 10 KB
-    __shared__ half block_B[STAGES][BN][BK+8];         // 32 × 136 = 8.5 KB
+    __shared__ half block_A[STAGES][BK][BM];
+    __shared__ half block_B[STAGES][BN][BK];
     float res[MMA_PER_WARP_M][MMA_PER_WARP_N][4];
     #pragma unroll
     for (int i=0; i<MMA_PER_WARP_M; i++)
@@ -113,6 +114,8 @@ __global__ __launch_bounds__(128, 3) void kernel(int M, int N, int K, half *A, h
             for (int k=0; k<4; k++)
                 res[i][j][k] = 0.0f;
 
+    auto block_A_at = [&](int stage, int k, int m) -> half& {return block_A[stage][k][m^((k&7)<<3)];};
+    auto block_B_at = [&](int stage, int n, int k) -> half& {return block_B[stage][n][k^((n&3)<<3)];};
     auto issue = [&](int stage, int k_tile)
     {
         #pragma unroll
@@ -122,7 +125,7 @@ __global__ __launch_bounds__(128, 3) void kernel(int M, int N, int K, half *A, h
             int off_k = id / 16;
             int off_m = id % 16 * 8;
             const half *src = &A_at(A, block_m+off_m, k_tile+off_k);
-            cp_async_16(&block_A[stage][off_k][off_m], src);
+            cp_async_16(&block_A_at(stage, off_k, off_m), src);
         }
         #pragma unroll
         for (int j=0; j<4; j++)
@@ -131,7 +134,7 @@ __global__ __launch_bounds__(128, 3) void kernel(int M, int N, int K, half *A, h
             int off_n = id / 4;
             int off_k = id % 4 * 8;
             const half *src = &B_at(B, k_tile+off_k, block_n+off_n);
-            cp_async_16(&block_B[stage][off_n][off_k], src);
+            cp_async_16(&block_B_at(stage, off_n, off_k), src);
         }
         cp_async_commit();
     };
@@ -158,7 +161,7 @@ __global__ __launch_bounds__(128, 3) void kernel(int M, int N, int K, half *A, h
             for (int i=0; i<MMA_PER_WARP_M; i++)
             {
                 int mma_m = i * MMA_M;
-                const half *src = &block_A[stage][mma_k+lane_id%16][warp_m_offset+mma_m+lane_id/16*8];
+                const half *src = &block_A_at(stage, mma_k+lane_id%16, warp_m_offset+mma_m+lane_id/16*8);
                 ldmatrix_x4_trans(frag_a[i][0], frag_a[i][2], frag_a[i][1], frag_a[i][3], src); //^T
             }
             uint32_t frag_b[MMA_PER_WARP_N][2];
@@ -168,7 +171,7 @@ __global__ __launch_bounds__(128, 3) void kernel(int M, int N, int K, half *A, h
                 int mma_n = j * MMA_N * 2;
                 int row = (lane_id % 8) + (lane_id / 16) * 8;
                 int col = ((lane_id / 8) % 2) * 8;
-                const half *src =&block_B[stage][warp_n_offset+mma_n+row][mma_k+col];
+                const half *src =&block_B_at(stage, warp_n_offset+mma_n+row, mma_k+col);
                 ldmatrix_x4(frag_b[j<<1][0], frag_b[j<<1][1], frag_b[j<<1|1][0], frag_b[j<<1|1][1], src);
             }
             #pragma unroll
@@ -276,9 +279,9 @@ int main(int argc, const char **argv) {
     dim3 grid = dim3((m+tile-1)/tile, (n+tile-1)/tile);
     for (int i = 0; i < Nt+2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        float_to_half_vec4<<< (m*k/4+255)/256, 256>>>(A, Ah, m*k);
-        float_to_half_vec4<<< (k*n/4+255)/256, 256>>>(B, Bh, k*n);
-        kernel<<< grid, block>>>(m, n, k, Ah, Bh, C2);
+        float_to_half_vec4<<< (m*k/4+255)/256, 256 >>>(A, Ah, m*k);
+        float_to_half_vec4<<< (k*n/4+255)/256, 256 >>>(B, Bh, k*n);
+        kernel<<< grid, block >>>(m, n, k, Ah, Bh, C2);
         cudaDeviceSynchronize();
     }
 
