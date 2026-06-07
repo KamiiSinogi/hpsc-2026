@@ -21,8 +21,7 @@ constexpr int MMA_PER_WARP_M = WM / MMA_M;        // 4
 constexpr int MMA_PER_WARP_N = WN / MMA_N;        // 8
 constexpr int K_ITER_PER_TILE = BK / MMA_K;       // 2
 
-constexpr int STAGES = 4;                         // Best choice
-const int smem_bytes = STAGES * (BK * BM + BN * BK) * sizeof(half);
+constexpr int STAGES = 3;                         // Best choice
 
 __device__ __forceinline__ half &A_at(half *A, int i, int j, int M=10240) {return A[i+j*M];}
 __device__ __forceinline__ half &B_at(half *B, int i, int j, int K=4096) {return B[i+j*K];}
@@ -104,9 +103,8 @@ __global__ __launch_bounds__(128, 3) void kernel(int M, int N, int K, half *A, h
     int warp_n = warp_id % WARPS_N;          // 0..1
     int warp_m_offset = warp_m * WM;
     int warp_n_offset = warp_n * WN;
-    extern __shared__ uint8_t smem[];
-    half (*block_A)[BK][BM] = reinterpret_cast<half (*)[BK][BM]>(smem);
-    half (*block_B)[BN][BK] = reinterpret_cast<half (*)[BN][BK]>(smem+STAGES*BK*BM*sizeof(half));
+    __shared__ half block_A[STAGES][BK][BM];
+    __shared__ half block_B[STAGES][BN][BK];
     float res[MMA_PER_WARP_M][MMA_PER_WARP_N][4];
     #pragma unroll
     for (int i=0; i<MMA_PER_WARP_M; i++)
@@ -279,13 +277,12 @@ int main(int argc, const char **argv) {
     int tile = 128;
     dim3 block = dim3(tile);
     dim3 grid = dim3((m+tile-1)/tile, (n+tile-1)/tile);
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     for (int i=0; i<Nt+2; i++)
     {
         if (i==2) tic = chrono::steady_clock::now();
         float_to_half_vec4<<< (m*k/4+255)/256, 256 >>>(A, Ah, m*k);
         float_to_half_vec4<<< (k*n/4+255)/256, 256 >>>(B, Bh, k*n);
-        kernel<<< grid, block, smem_bytes >>>(m, n, k, Ah, Bh, C2);
+        kernel<<< grid, block >>>(m, n, k, Ah, Bh, C2);
         cudaDeviceSynchronize();
     }
 
