@@ -21,16 +21,33 @@ constexpr int MMA_PER_WARP_M = WM / MMA_M;        // 4
 constexpr int MMA_PER_WARP_N = WN / MMA_N;        // 8
 constexpr int K_ITER_PER_TILE = BK / MMA_K;       // 2
 
-constexpr int STAGES=4;
+constexpr int STAGES=3;
 
-__device__ __forceinline__ float &A_at(float *A, int i, int j, int M=10240) {return A[i+j*M];}
-__device__ __forceinline__ float &B_at(float *B, int i, int j, int K=4096) {return B[i+j*K];}
+__device__ __forceinline__ half &A_at(half *A, int i, int j, int M=10240) {return A[i+j*M];}
+__device__ __forceinline__ half &B_at(half *B, int i, int j, int K=4096) {return B[i+j*K];}
 __device__ __forceinline__ float &C_at(float *C, int i, int j, int M=10240) {return C[i+j*M];}
 
 __device__ __forceinline__ uint32_t smem_ptr_to_uint(const void *ptr)
 {
     return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
 }
+
+__device__ __forceinline__ void cp_async_16(void *dst, const void *src)
+{
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :: "r"(smem_ptr_to_uint(dst)), "l"(src));
+}
+__device__ __forceinline__ void cp_async_commit()
+{
+    asm volatile("cp.async.commit_group;\n");
+}
+
+template<int N>
+__device__ __forceinline__ void cp_async_wait()
+{
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
 
 __device__ __forceinline__ void ldmatrix_x4_trans(
     uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3,
@@ -44,6 +61,18 @@ __device__ __forceinline__ void ldmatrix_x4_trans(
         : "r"(addr));
 }
 
+__device__ __forceinline__ void ldmatrix_x4(
+    uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3,
+    const void *smem_ptr)
+{
+    uint32_t addr = smem_ptr_to_uint(smem_ptr);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+        "{%0, %1, %2, %3}, [%4];\n"
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+        : "r"(addr));
+}
+
 __device__ __forceinline__ void ldmatrix_x2_trans(
     uint32_t &r0, uint32_t &r1,
     const void *smem_ptr)
@@ -51,6 +80,18 @@ __device__ __forceinline__ void ldmatrix_x2_trans(
     uint32_t addr = smem_ptr_to_uint(smem_ptr);
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
+        "{%0, %1}, [%2];\n"
+        : "=r"(r0), "=r"(r1)
+        : "r"(addr));
+}
+
+__device__ __forceinline__ void ldmatrix_x2(
+    uint32_t &r0, uint32_t &r1,
+    const void *smem_ptr)
+{
+    uint32_t addr = smem_ptr_to_uint(smem_ptr);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
         "{%0, %1}, [%2];\n"
         : "=r"(r0), "=r"(r1)
         : "r"(addr));
@@ -74,7 +115,7 @@ __device__ __forceinline__ void mma_m16n8k16(
           "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 }
 
-__global__ void kernel_0(int M, int N, int K, float *A, float *B, float *C)
+__global__ void kernel(int M, int N, int K, half *A, half *B, float *C)
 {
     int block_m = BM * blockIdx.x;
     int block_n = BN * blockIdx.y;
@@ -86,57 +127,59 @@ __global__ void kernel_0(int M, int N, int K, float *A, float *B, float *C)
     int warp_m_offset = warp_m * WM;
     int warp_n_offset = warp_n * WN;
 
-    __shared__ half block_A[BK][BM];         // 32 × 128 = 8 KB
-    __shared__ half block_B[BK][BN];         // 32 × 128 = 8 KB
+    __shared__ half block_A[BK][BM];         // 128 × 32 = 8 KB
+    __shared__ half block_B[BN][BK];         // 32 × 128 = 8 KB
     float res[MMA_PER_WARP_M][MMA_PER_WARP_N][4];
     #pragma unroll
-    for(int i=0; i<MMA_PER_WARP_M; i++)
+    for (int i=0; i<MMA_PER_WARP_M; i++)
         #pragma unroll
-        for(int j=0; j<MMA_PER_WARP_N; j++)
+        for (int j=0; j<MMA_PER_WARP_N; j++)
             #pragma unroll
-            for(int k=0; k<4; k++)
+            for (int k=0; k<4; k++)
                 res[i][j][k] = 0.0f;
 
-    for(int k_tile=0; k_tile<K; k_tile+=BK)
+    for (int k_tile=0; k_tile<K; k_tile+=BK)
     {
         __syncthreads();
         #pragma unroll
         for (int k=0; k<BK; k++)
         {   
-            block_A[k][tid] = __float2half(A_at(A, block_m+tid, k_tile+k));
+            block_A[k][tid] = A_at(A, block_m+tid, k_tile+k);
         }
         #pragma unroll
         for (int k=0; k<BK; k++)
         {
-            block_B[k][tid] = __float2half(B_at(B, k_tile+k, block_n+tid));
+            block_B[tid][k] = B_at(B, k_tile+k, block_n+tid);
         }
         __syncthreads();
 
         #pragma unroll
-        for(int k=0; k<K_ITER_PER_TILE; k++)
+        for (int k=0; k<K_ITER_PER_TILE; k++)
         {
             int mma_k = k * MMA_K;
             uint32_t frag_a[MMA_PER_WARP_M][4];
             #pragma unroll
-            for(int i=0; i<MMA_PER_WARP_M; i++)
+            for (int i=0; i<MMA_PER_WARP_M; i++)
             {
                 int mma_m = i * MMA_M;
                 const half *src = &block_A[mma_k+lane_id%16][warp_m_offset+mma_m+lane_id/16*8];
-                ldmatrix_x4_trans(frag_a[i][0], frag_a[i][2], frag_a[i][1], frag_a[i][3], src);
+                ldmatrix_x4_trans(frag_a[i][0], frag_a[i][2], frag_a[i][1], frag_a[i][3], src); //^T
             }
             uint32_t frag_b[MMA_PER_WARP_N][2];
             #pragma unroll
-            for (int j=0; j<MMA_PER_WARP_N; j++)
+            for (int j=0; j<MMA_PER_WARP_N/2; j++)
             {
-                int mma_n = j * MMA_N;
-                const half *src =&block_B[mma_k+lane_id%16][warp_n_offset+mma_n];
-                ldmatrix_x2_trans(frag_b[j][0], frag_b[j][1], src);
+                int mma_n = j * MMA_N * 2;
+                int row = (lane_id % 8) + (lane_id / 16) * 8;
+                int col = ((lane_id / 8) % 2) * 8;
+                const half *src =&block_B[warp_n_offset+mma_n+row][mma_k+col];
+                ldmatrix_x4(frag_b[j<<1][0], frag_b[j<<1][1], frag_b[j<<1|1][0], frag_b[j<<1|1][1], src);
             }
             #pragma unroll
-            for(int i=0; i<MMA_PER_WARP_M; i++)
+            for (int i=0; i<MMA_PER_WARP_M; i++)
             {
                 #pragma unroll
-                for(int j=0; j<MMA_PER_WARP_N; j++)
+                for (int j=0; j<MMA_PER_WARP_N; j++)
                 {
                     mma_m16n8k16(
                         res[i][j][0], res[i][j][1], res[i][j][2], res[i][j][3],
@@ -150,10 +193,10 @@ __global__ void kernel_0(int M, int N, int K, float *A, float *B, float *C)
     int group_row = lane_id / 4;
     int group_col = lane_id % 4;
     #pragma unroll
-    for(int i=0; i<MMA_PER_WARP_M; i++)
+    for (int i=0; i<MMA_PER_WARP_M; i++)
     {
         #pragma unroll
-        for(int j=0; j<MMA_PER_WARP_N; j++)
+        for (int j=0; j<MMA_PER_WARP_N; j++)
         {
             int base_m = block_m + warp_m_offset + i * MMA_M;
             int base_n = block_n + warp_n_offset + j * MMA_N;
@@ -169,47 +212,15 @@ __global__ void kernel_0(int M, int N, int K, float *A, float *B, float *C)
     }
 }
 
-__global__ void kernel(int dim_m, int dim_n, int dim_k,
-                     float *d_a, float *d_b, float *d_c) {
-    int offset_a_m = 64 * blockIdx.x;
-    int offset_b_n = 64 * blockIdx.y;
-    int i = threadIdx.x;
-    int warp_id = threadIdx.x / 32;
-
-    __shared__ half block_a[16][64];
-    __shared__ half block_b[16][64];
-
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
-    for (int r = 0; r < 2; r++)
-        for (int c = 0; c < 4; c++)
-            wmma::fill_fragment(acc[r][c], 0.0f);
-
-    for (int k = 0; k < dim_k; k += 16) {
-        __syncthreads();
-        for (int j = 0; j < 16; ++j) {
-            block_a[j][i] = __float2half(d_a[(k + j) * dim_m + offset_a_m + i]);
-            block_b[j][i] = __float2half(d_b[(offset_b_n + i) * dim_k + k + j]);
-        }
-        __syncthreads();
-        for (int r = 0; r < 2; r++) {
-            int row_tile = warp_id * 2 + r;
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-            wmma::load_matrix_sync(a_frag, &block_a[0][row_tile * 16], 64);
-            for (int c = 0; c < 4; c++) {
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                wmma::load_matrix_sync(b_frag, &block_b[0][c * 16], 64);
-                wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
-            }
-        }
-    }
-    for (int r = 0; r < 2; r++) {
-        for (int c = 0; c < 4; c++) {
-            int c_m = offset_a_m + (warp_id * 2 + r) * 16;
-            int c_n = offset_b_n + c * 16;
-            if (c_n < dim_n && c_m < dim_m)
-                wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
-        }
-    }
+__global__ void float_to_half_vec4(const float *src, half *dst, int64_t n)
+{
+    int64_t i = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 >= n) return;
+    float4 f = *reinterpret_cast<const float4*>(src + i);
+    half2 h01 = __floats2half2_rn(f.x, f.y);
+    half2 h23 = __floats2half2_rn(f.z, f.w);
+    reinterpret_cast<half2*>(dst + i)[0] = h01;
+    reinterpret_cast<half2*>(dst + i)[1] = h23;
 }
 
 int main(int argc, const char **argv) {
@@ -220,10 +231,13 @@ int main(int argc, const char **argv) {
     float beta = 0.0;
     int Nt = 10;
     float *A, *B, *C, *C2;
+    half *Ah, *Bh;
     cudaMallocManaged(&A, m * k * sizeof(float));
     cudaMallocManaged(&B, k * n * sizeof(float));
     cudaMallocManaged(&C, m * n * sizeof(float));
     cudaMallocManaged(&C2, m * n * sizeof(float));
+    cudaMallocManaged(&Ah, m * k * sizeof(half));
+    cudaMallocManaged(&Bh, k * n * sizeof(half));
     for (int i=0; i<m; i++)
         for (int j=0; j<k; j++)
             A[k*i+j] = drand48();
@@ -263,28 +277,11 @@ int main(int argc, const char **argv) {
     dim3 grid = dim3((m+tile-1)/tile, (n+tile-1)/tile);
     for (int i = 0; i < Nt+2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        kernel_0<<< grid, block >>>(m,
-                        n,
-                        k,
-                        A,
-                        B,
-                        C2);
+        float_to_half_vec4<<< (m*k/4+255)/256, 256>>>(A, Ah, m*k);
+        float_to_half_vec4<<< (k*n/4+255)/256, 256>>>(B, Bh, k*n);
+        kernel<<< grid, block>>>(m, n, k, Ah, Bh, C2);
         cudaDeviceSynchronize();
     }
-
-    // int tile = 64;
-    // dim3 block = dim3(tile);
-    // dim3 grid = dim3((m+tile-1)/tile, (n+tile-1)/tile);
-    // for (int i = 0; i < Nt+2; i++) {
-    //     if (i == 2) tic = chrono::steady_clock::now();
-    //     kernel<<< grid, block >>>(m,
-    //                     n,
-    //                     k,
-    //                     A,
-    //                     B,
-    //                     C2);
-    //     cudaDeviceSynchronize();
-    // }
 
     toc = chrono::steady_clock::now();
     double tcutlass = chrono::duration<double>(toc - tic).count() / Nt;
