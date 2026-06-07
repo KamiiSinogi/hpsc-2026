@@ -73,30 +73,6 @@ __device__ __forceinline__ void ldmatrix_x4(
         : "r"(addr));
 }
 
-__device__ __forceinline__ void ldmatrix_x2_trans(
-    uint32_t &r0, uint32_t &r1,
-    const void *smem_ptr)
-{
-    uint32_t addr = smem_ptr_to_uint(smem_ptr);
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
-        "{%0, %1}, [%2];\n"
-        : "=r"(r0), "=r"(r1)
-        : "r"(addr));
-}
-
-__device__ __forceinline__ void ldmatrix_x2(
-    uint32_t &r0, uint32_t &r1,
-    const void *smem_ptr)
-{
-    uint32_t addr = smem_ptr_to_uint(smem_ptr);
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
-        "{%0, %1}, [%2];\n"
-        : "=r"(r0), "=r"(r1)
-        : "r"(addr));
-}
-
 __device__ __forceinline__ void mma_m16n8k16(
     float& d0, float& d1, float& d2, float& d3,
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
@@ -115,7 +91,7 @@ __device__ __forceinline__ void mma_m16n8k16(
           "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 }
 
-__global__ void kernel(int M, int N, int K, half *A, half *B, float *C)
+__global__ __launch_bounds__(128, 3) void kernel(int M, int N, int K, half *A, half *B, float *C)
 {
     int block_m = BM * blockIdx.x;
     int block_n = BN * blockIdx.y;
@@ -126,9 +102,8 @@ __global__ void kernel(int M, int N, int K, half *A, half *B, float *C)
     int warp_n = warp_id % WARPS_N;          // 0..1
     int warp_m_offset = warp_m * WM;
     int warp_n_offset = warp_n * WN;
-
-    __shared__ half block_A[STAGES][BK][BM+8];         // 128 × 32 = 8 KB
-    __shared__ half block_B[STAGES][BN][BK+8];         // 32 × 128 = 8 KB
+    __shared__ half block_A[STAGES][BK][BM+8];         // 128 × 40 = 10 KB
+    __shared__ half block_B[STAGES][BN][BK+8];         // 32 × 136 = 8.5 KB
     float res[MMA_PER_WARP_M][MMA_PER_WARP_N][4];
     #pragma unroll
     for (int i=0; i<MMA_PER_WARP_M; i++)
