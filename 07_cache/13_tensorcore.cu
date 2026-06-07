@@ -21,7 +21,7 @@ constexpr int MMA_PER_WARP_M = WM / MMA_M;        // 4
 constexpr int MMA_PER_WARP_N = WN / MMA_N;        // 8
 constexpr int K_ITER_PER_TILE = BK / MMA_K;       // 2
 
-constexpr int STAGES=3;
+constexpr int STAGES = 3;                         // Best choice
 
 __device__ __forceinline__ half &A_at(half *A, int i, int j, int M=10240) {return A[i+j*M];}
 __device__ __forceinline__ half &B_at(half *B, int i, int j, int K=4096) {return B[i+j*K];}
@@ -127,8 +127,8 @@ __global__ void kernel(int M, int N, int K, half *A, half *B, float *C)
     int warp_m_offset = warp_m * WM;
     int warp_n_offset = warp_n * WN;
 
-    __shared__ half block_A[STAGES][BK][BM];         // 128 × 32 = 8 KB
-    __shared__ half block_B[STAGES][BN][BK];         // 32 × 128 = 8 KB
+    __shared__ half block_A[STAGES][BK][BM+8];         // 128 × 32 = 8 KB
+    __shared__ half block_B[STAGES][BN][BK+8];         // 32 × 128 = 8 KB
     float res[MMA_PER_WARP_M][MMA_PER_WARP_N][4];
     #pragma unroll
     for (int i=0; i<MMA_PER_WARP_M; i++)
